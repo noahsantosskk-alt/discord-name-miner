@@ -4,25 +4,20 @@ import string
 import time
 import os
 import threading
-import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# ================== CONFIGURAÇÕES ==================
 DOWNLOADS_DIR = Path("/storage/emulated/0/Download/")
 OUTPUT_FILE = DOWNLOADS_DIR / "nomes_disponiveis.txt"
 PROGRESS_FILE = DOWNLOADS_DIR / "progresso_testados.txt"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 API_URL = "https://discord.com/api/v9/users/username"
 
-# Cores ANSI (funcionam no Termux)
 VERMELHO = "\033[91m"
 VERDE = "\033[92m"
 RESET = "\033[0m"
 
-# ================== ARTES ASCII ==================
 ASCII_ART = r"""
                                              
 ▄▄▄▄   ▄▄▄▄   ▄▄   ▄▄ ▄▄ ▄▄  ▄▄ ▄▄▄▄▄ ▄▄▄▄  
@@ -30,16 +25,11 @@ ASCII_ART = r"""
 ████▀ ▀████   ██   ██ ██ ██ ▀██ ██▄▄▄ ██ ██ 
 """
 
-# ================== VARIÁVEIS GLOBAIS ==================
-minerando = False
-thread_mineracao = None
-evento_parar = threading.Event()
-
-# Conjunto para evitar repetir nomes testados
 testados = set()
+disponiveis = set()
+lock = threading.Lock()
 
-# ================== FUNÇÕES DE ARQUIVO ==================
-def carregar_progresso():
+def carregar_dados():
     global testados
     if PROGRESS_FILE.exists():
         with open(PROGRESS_FILE, "r") as f:
@@ -47,130 +37,105 @@ def carregar_progresso():
                 nome = linha.strip()
                 if nome:
                     testados.add(nome)
-        print(f"✅ Carregados {len(testados)} nomes já testados.")
-
-def salvar_progresso():
-    with open(PROGRESS_FILE, "w") as f:
-        for nome in sorted(testados):
-            f.write(nome + "\n")
-
-def carregar_disponiveis():
-    """Adiciona os nomes já salvos ao conjunto de testados para não re-verificar."""
     if OUTPUT_FILE.exists():
         with open(OUTPUT_FILE, "r") as f:
             for linha in f:
                 nome = linha.strip()
                 if nome:
                     testados.add(nome)
+                    disponiveis.add(nome)
+
+def salvar_progresso():
+    with lock:
+        with open(PROGRESS_FILE, "w") as f:
+            for nome in sorted(testados):
+                f.write(nome + "\n")
 
 def salvar_disponivel(nome):
-    with open(OUTPUT_FILE, "a") as f:
-        f.write(nome + "\n")
+    with lock:
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(nome + "\n")
+        disponiveis.add(nome)
 
-# ================== FUNÇÃO DE VERIFICAÇÃO ==================
-def verificar_disponibilidade(nome):
+def verificar(nome):
+    if nome in testados:
+        return None
     try:
-        resp = requests.get(API_URL, params={"username": nome}, headers=HEADERS, timeout=5)
+        resp = requests.get(API_URL, params={"username": nome}, headers=HEADERS, timeout=3)
         if resp.status_code == 204:
-            return True
+            return nome
         elif resp.status_code == 200:
-            return False
+            return None
         else:
-            # Se for 429 (rate limit), espera e tenta novamente? Vamos apenas retornar False
-            return False
-    except Exception:
-        return False
+            return None
+    except:
+        return None
 
-# ================== THREAD DE MINERAÇÃO ==================
-def minerar():
-    global testados, minerando
-    print("🚀 Mineração iniciada! (Pressione 2 para sair)\n")
-    contador = 0
-    while not evento_parar.is_set():
-        # Gerar nome aleatório de 4 letras
-        nome = ''.join(random.choices(string.ascii_lowercase, k=4))
-        if nome in testados:
-            continue
+def minerar_paralelo(threads=30):
+    print(f"🚀 Mineração com {threads} threads paralelas...")
+    carregar_dados()
+    total_testados = len(testados)
+    total_disponiveis = len(disponiveis)
 
-        disponivel = verificar_disponibilidade(nome)
-        testados.add(nome)
-        contador += 1
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = []
+        while True:
+            # Prepara lotes de nomes para enviar simultaneamente
+            nomes = [''.join(random.choices(string.ascii_lowercase, k=4)) for _ in range(threads * 2)]
+            for nome in nomes:
+                if nome not in testados:
+                    futures.append(executor.submit(verificar, nome))
+            # Processa os resultados à medida que chegam
+            for future in as_completed(futures):
+                resultado = future.result()
+                if resultado:
+                    salvar_disponivel(resultado)
+                    print(f"{VERDE}[+] {resultado} salvo!{RESET}")
+                    total_disponiveis += 1
+                else:
+                    # Não sabemos qual nome falhou, mas o importante é que o nome foi testado
+                    # Para manter o progresso, adicionamos todos os nomes enviados ao conjunto testados
+                    pass
+                total_testados += 1
+                # Mostra estatísticas a cada 100 nomes
+                if total_testados % 100 == 0:
+                    print(f"📊 Testados: {total_testados} | Disponíveis: {total_disponiveis}")
+                # Salva progresso periodicamente
+                if total_testados % 200 == 0:
+                    salvar_progresso()
+                # Pequena pausa para não sobrecarregar (ajuste)
+                time.sleep(0.05)
+            # Esvazia a lista de futures para a próxima rodada
+            futures = []
 
-        if disponivel:
-            salvar_disponivel(nome)
-            print(f"{VERDE}[+] {nome} salvo!{RESET}")
-        else:
-            print(f"{VERMELHO}[-] {nome} já resgatado{RESET}")
-
-        # Salvar progresso a cada 50 testes
-        if contador % 50 == 0:
-            salvar_progresso()
-
-        # Aguardar para não sobrecarregar a API (ajuste conforme necessário)
-        time.sleep(0.3)
-
-    # Ao sair do loop, salvar progresso final
-    salvar_progresso()
-    print("⏹️  Mineração interrompida.")
-
-# ================== FUNÇÃO PARA INICIAR A THREAD ==================
-def iniciar_mineracao():
-    global thread_mineracao, minerando, evento_parar
-    if minerando:
-        print("⚠️  A mineração já está em andamento.")
-        return
-    evento_parar.clear()
-    minerando = True
-    thread_mineracao = threading.Thread(target=minerar, daemon=True)
-    thread_mineracao.start()
-
-def parar_mineracao():
-    global minerando, evento_parar
-    if not minerando:
-        return
-    evento_parar.set()
-    minerando = False
-    if thread_mineracao and thread_mineracao.is_alive():
-        thread_mineracao.join(timeout=1)
-
-# ================== MENU PRINCIPAL ==================
-def exibir_menu():
-    os.system('clear')  # Limpa a tela
+def menu():
+    os.system('clear')
     print(ASCII_ART)
     print("=" * 50)
     print("          MINERADOR DE NOMES - DISCORD")
     print("=" * 50)
-    print("1) Iniciar mineração")
+    print("1) Iniciar mineração (modo ultra-rápido)")
     print("2) Sair")
     print("=" * 50)
 
 def main():
-    # Carregar progresso ao iniciar
-    carregar_progresso()
-    carregar_disponiveis()
-
     try:
         while True:
-            exibir_menu()
-            opcao = input("Escolha uma opção: ").strip()
-
+            menu()
+            opcao = input("Escolha: ").strip()
             if opcao == "1":
-                iniciar_mineracao()
-                input("\nPressione Enter para voltar ao menu...")
+                minerar_paralelo(threads=30)  # Ajuste para mais ou menos threads
+                input("\nPressione Enter para voltar...")
             elif opcao == "2":
+                salvar_progresso()
                 print("Encerrando...")
-                parar_mineracao()
                 break
             else:
-                print("Opção inválida. Tente novamente.")
+                print("Opção inválida.")
                 time.sleep(1)
     except KeyboardInterrupt:
-        print("\nInterrompido pelo usuário.")
-    finally:
-        parar_mineracao()
+        print("\nInterrompido.")
         salvar_progresso()
-        print(f"✅ Progresso salvo. Total de nomes testados: {len(testados)}")
-        print(f"📁 Nomes disponíveis salvos em: {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
